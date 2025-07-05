@@ -1,0 +1,250 @@
+import logging
+import mysql.connector
+import argparse
+from CognexNativePy import NativeInterface
+from typing import Optional
+import os
+import tempfile
+from mysql.connector.pooling import MySQLConnectionPool
+import re
+import time
+
+# Configure logging for detailed runtime information
+logging.basicConfig(
+    level=logging.DEBUG,  # Set to DEBUG for capturing all log levels
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
+
+class DatabaseManager:
+    """
+    Handles all interactions with the MySQL database, including connection pooling,
+    executing queries, and saving image data.
+    """
+    
+    def __init__(self, host: str, port: int, user: str, password: str):
+        """
+        Initialize the DatabaseManager with database credentials.
+        Creates a connection pool to improve efficiency.
+        """
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.pool = MySQLConnectionPool(
+            pool_name="mypool",
+            pool_size=5,
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password
+        )
+
+    def __repr__(self):
+        return f"DatabaseManager(host='{self.host}', port={self.port}, user='{self.user}')"
+
+    def __enter__(self):
+        # Return the object itself for use within a context manager
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Context manager cleanup logic, if any additional cleanup is needed
+        pass
+
+    def connect(self, database: str) -> mysql.connector.MySQLConnection:
+        """
+        Establish a connection to the specified MySQL database using connection pooling.
+        Logs successful connections for debugging and monitoring.
+        """
+        try:
+            logging.debug(f"Connecting to database: {database} using connection pool.")
+            connection = self.pool.get_connection()  # Get a connection from the pool
+            connection.database = database
+            logging.info(f"Connected to database: {database}")
+            return connection
+        except mysql.connector.Error as e:
+            logging.error(f"Failed to connect to database: {e}")
+            raise
+
+    def get_variant_id(self, variant_name: str, database_name: str) -> Optional[int]:
+        """
+        Fetch the idVariant associated with a given variantName from the Variants table.
+        """
+        if not variant_name.strip():
+            raise ValueError("Variant name cannot be empty.")
+
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', variant_name):
+            raise ValueError("Variant name contains invalid characters.")
+
+        query = "SELECT idVariant FROM Variants WHERE variantName = %s"
+        try:
+            start_time = time.time()  # Start timer for performance monitoring
+            with self.connect(database_name) as connection:
+                with connection.cursor() as cursor:
+                    logging.debug(f"Executing query: {query} with variant_name: {variant_name}")
+                    cursor.execute(query, (variant_name,))
+                    result = cursor.fetchone()
+                    elapsed_time = time.time() - start_time
+                    logging.info(f"Query executed in {elapsed_time:.4f} seconds.")
+                    if result:
+                        logging.info(f"Found idVariant for variant '{variant_name}': {result[0]}")
+                        return result[0]
+                    logging.warning(f"Variant '{variant_name}' not found.")
+                    return None
+        except mysql.connector.Error as e:
+            logging.error(f"Database error while fetching idVariant: {e}")
+            raise
+
+    def save_image(self, database_name: str, id_variant: int, image_path: str, image_type: int) -> None:
+        """
+        Save the image data to the appropriate database table based on the image type.
+        """
+        if image_type not in [1, 2]:
+            raise ValueError("Invalid image type. Use 1 for pre-image or 2 for post-image.")
+
+        table_name = "ImagePreProcess" if image_type == 1 else "ImagePostProcess"
+        column_name = "preImage" if image_type == 1 else "postImage"
+
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+        query = f"INSERT INTO {table_name} (idVariant, {column_name}) VALUES (%s, %s)"
+        try:
+            start_time = time.time()  # Start timer for performance monitoring
+            with open(image_path, 'rb') as img_file:
+                image_blob = img_file.read()  # Read the binary image data
+
+            if not image_blob:
+                raise ValueError("Image file is empty or invalid.")
+
+            with self.connect(database_name) as connection:
+                with connection.cursor() as cursor:
+                    logging.debug(f"Executing query: {query} with id_variant: {id_variant}")
+                    cursor.execute(query, (id_variant, image_blob))  # Execute the insert query
+                    connection.commit()  # Commit the transaction
+                    elapsed_time = time.time() - start_time
+                    logging.info(f"Image saved successfully in {elapsed_time:.4f} seconds to {table_name}.")
+        except mysql.connector.Error as e:
+            logging.error(f"Database error while saving image to {table_name}: {e}")
+            raise
+
+class CognexManager:
+    """
+    Handles interactions with the Cognex vision system, including loading jobs and capturing images.
+    """
+
+    def __init__(self, ip: str, user: str, password: str):
+        """
+        Initialize the CognexManager with connection details.
+        """
+        self.native_interface = NativeInterface(ip, user, password)
+
+    def __repr__(self):
+        return f"CognexManager(ip='{self.native_interface.ip}')"
+
+    def __enter__(self):
+        # Return the object itself for use within a context manager
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self.native_interface.disconnect()
+            logging.info("Disconnected from Cognex vision system.")
+        except AttributeError:
+            pass
+
+    def capture_image(self, job_name: str, output_path: str) -> None:
+        """
+        Capture an image from the Cognex vision system and save it to a file.
+        """
+        if not job_name.strip():
+            raise ValueError("Job name cannot be empty.")
+
+        try:
+            start_time = time.time()
+            exec_online = self.native_interface.execution_and_online
+            file_job = self.native_interface.file_and_job
+            image = self.native_interface.image
+
+            if file_job.get_file() != job_name:
+                if exec_online.get_online() == 1:
+                    exec_online.set_online(0)
+                file_job.load_file(job_name)
+
+            if exec_online.get_online() == 0:
+                exec_online.set_online(1)
+
+            image_data = image.read_image()
+            with open(output_path, 'wb') as f:
+                f.write(image_data["data"])
+
+            elapsed_time = time.time() - start_time
+            logging.info(f"Image captured and saved to {output_path} in {elapsed_time:.4f} seconds.")
+        except Exception as e:
+            logging.error(f"Error capturing image: {e}")
+            raise
+
+def retry_operation(operation, retries: int = 3, *args, **kwargs):
+    """
+    Retry a specified operation up to a defined number of retries.
+    """
+    for attempt in range(retries):
+        try:
+            result = operation(*args, **kwargs)
+            if attempt > 0:
+                logging.info(f"'{operation.__name__}' succeeded after {attempt} retries.")
+            return result
+        except Exception as e:
+            logging.warning(f"Attempt {attempt + 1} to execute '{operation.__name__}' failed: {e}")
+            if attempt == retries - 1:
+                logging.error("All retry attempts failed.")
+                raise
+
+def main():
+    """
+    Main function to manage the workflow: capture an image and save it in the appropriate database table.
+    """
+    parser = argparse.ArgumentParser(
+        description="Capture an image for a specified variant and save it in the database."
+    )
+    parser.add_argument('--variant_name', required=True, help="The name of the variant (Customer-Variant) provided by LabVIEW.")
+    parser.add_argument('--image_type', required=True, type=int, choices=[1, 2], help="Image type: 1 for pre-image, 2 for post-image.")
+    args = parser.parse_args()
+
+    variant_name = args.variant_name.strip()
+
+    if not variant_name:
+        logging.error("Variant name cannot be empty. Exiting.")
+        return
+
+    with DatabaseManager(
+        host='136.16.182.41',
+        port=3377,
+        user='jcontramestre',
+        password='904OBol6PY0mcIpN'
+    ) as database_manager, CognexManager(
+        ip='192.168.0.253',
+        user='admin',
+        password=''
+    ) as cognex_manager:
+
+        database_name = 'LiquidSealRobot'
+        job_name = '1myJob.job'
+
+        try:
+            id_variant = retry_operation(database_manager.get_variant_id, 3, variant_name, database_name)
+            if id_variant is None:
+                logging.error("Variant ID not found. Exiting.")
+                return
+
+            with tempfile.NamedTemporaryFile(suffix='.bmp', delete=True) as temp_image:
+                temp_image_path = temp_image.name
+                retry_operation(cognex_manager.capture_image, 3, job_name, temp_image_path)
+                retry_operation(database_manager.save_image, 3, database_name, id_variant, temp_image_path, args.image_type)
+
+        except KeyboardInterrupt:
+            logging.warning("Operation interrupted by the user.")
+        except Exception as e:
+            logging.critical(f"Workflow failed: {e}")
+
+if __name__ == "__main__":
+    main()
